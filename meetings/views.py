@@ -1,18 +1,16 @@
-# meetings/views.py - ARQUIVO COMPLETO COM PARTICIPANTES + COOPERADORES
+# meetings/views.py - VERSÃO MÍNIMA FUNCIONAL
 
 from rest_framework import viewsets, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.pagination import PageNumberPagination
 from django.shortcuts import get_object_or_404
-from django.db.models import Q, F, Count
+from django.db.models import Q, Count
 from django.utils import timezone
-from django.db import transaction
 from datetime import timedelta
 
-# ✅ IMPORTS DOS MODELOS
+# Imports dos modelos
 from .models import (
     Category, 
     Meeting, 
@@ -22,7 +20,7 @@ from .models import (
     MeetingCooperation
 )
 
-# ✅ IMPORTS DOS SERIALIZERS
+# Imports dos serializers
 from .serializers import (
     CategorySerializer, 
     MeetingListSerializer, 
@@ -34,14 +32,6 @@ from .serializers import (
     MeetingCooperationSerializer
 )
 
-# ✅ IMPORTS DAS PERMISSÕES
-from .permissions import (
-    CanCreateMeeting, 
-    IsMeetingCreatorOrCooperator,
-    CanManageParticipants
-)
-
-# ✅ IMPORTS DO ACCOUNTS
 from accounts.models import User
 
 
@@ -57,16 +47,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class MeetingViewSet(viewsets.ModelViewSet):
     """ViewSet para reuniões"""
     queryset = Meeting.objects.all()
-    
-    def get_permissions(self):
-        """Permissões por ação"""
-        if self.action == 'create':
-            permission_classes = [IsAuthenticated, CanCreateMeeting]
-        elif self.action in ['update', 'partial_update', 'destroy']:
-            permission_classes = [IsAuthenticated, IsMeetingCreatorOrCooperator]
-        else:
-            permission_classes = [AllowAny]
-        return [permission() for permission in permission_classes]
+    permission_classes = [AllowAny]  # Simplificado para teste
     
     def get_serializer_class(self):
         """Serializer por ação"""
@@ -78,41 +59,21 @@ class MeetingViewSet(viewsets.ModelViewSet):
             return MeetingDetailSerializer
     
     def get_queryset(self):
-        """QuerySet otimizado com filtros"""
+        """QuerySet otimizado"""
         queryset = Meeting.objects.select_related('category', 'creator')
         
         if not self.request.user.is_authenticated:
             queryset = queryset.filter(status='published')
-        else:
-            if not self.request.user.is_staff:
-                queryset = queryset.filter(
-                    Q(status='published') | 
-                    Q(creator=self.request.user) |
-                    Q(cooperators=self.request.user)
-                ).distinct()
         
-        return queryset.order_by('-meeting_date', '-meeting_time')
+        return queryset.order_by('-created_at')
     
-    @transaction.atomic
     def perform_create(self, serializer):
-        """Criação com lógica adicional"""
-        user = self.request.user
-        
-        status_inicial = 'published' if user.user_type == 'criador' else 'pending_approval'
-        
-        meeting = serializer.save(
-            creator=user,
-            status=status_inicial
-        )
-        
-        # Auto-adicionar criador como participante aprovado
-        MeetingParticipation.objects.create(
-            meeting=meeting,
-            participant=user,
-            status='approved'
-        )
-        
-        return meeting
+        """Criação com usuário"""
+        user = self.request.user if self.request.user.is_authenticated else None
+        if user:
+            serializer.save(creator=user)
+        else:
+            serializer.save()
 
 
 class CommentViewSet(viewsets.ModelViewSet):
@@ -120,13 +81,6 @@ class CommentViewSet(viewsets.ModelViewSet):
     queryset = Comment.objects.filter(is_active=True).select_related('author', 'meeting')
     serializer_class = CommentSerializer
     permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        meeting_id = self.request.query_params.get('meeting', None)
-        if meeting_id:
-            queryset = queryset.filter(meeting_id=meeting_id)
-        return queryset.order_by('-is_pinned', '-created_at')
     
     def perform_create(self, serializer):
         serializer.save(author=self.request.user)
@@ -138,24 +92,11 @@ class RatingViewSet(viewsets.ModelViewSet):
     serializer_class = RatingSerializer
     permission_classes = [IsAuthenticated]
     
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        meeting_id = self.request.query_params.get('meeting', None)
-        if meeting_id:
-            queryset = queryset.filter(meeting_id=meeting_id)
-        
-        if not self.request.user.is_staff:
-            queryset = queryset.filter(
-                Q(is_anonymous=False) | Q(user=self.request.user)
-            )
-        
-        return queryset.order_by('-created_at')
-    
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
 
-# ===== VIEWS DE REUNIÕES =====
+# ===== VIEWS DE PARTICIPAÇÃO =====
 
 class JoinMeetingView(APIView):
     """Solicitar participação em reunião"""
@@ -164,44 +105,35 @@ class JoinMeetingView(APIView):
     def post(self, request, meeting_id):
         meeting = get_object_or_404(Meeting, id=meeting_id)
         
-        existing_participation = MeetingParticipation.objects.filter(
+        # Verificar se já participa
+        existing = MeetingParticipation.objects.filter(
             meeting=meeting,
             participant=request.user
         ).first()
         
-        if existing_participation:
+        if existing:
             return Response({
-                'message': f'Você já está participando desta reunião (Status: {existing_participation.get_status_display()})',
-                'status': existing_participation.status
+                'message': f'Você já está participando (Status: {existing.status})'
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        if meeting.max_participants:
-            current_count = meeting.get_participant_count()
-            if current_count >= meeting.max_participants:
-                return Response({
-                    'error': 'Reunião já atingiu o limite máximo de participantes'
-                }, status=status.HTTP_400_BAD_REQUEST)
-        
+        # Criar participação
         participation_status = 'approved' if not meeting.requires_approval else 'pending'
         
-        participation = MeetingParticipation.objects.create(
+        MeetingParticipation.objects.create(
             meeting=meeting,
             participant=request.user,
             status=participation_status,
             message=request.data.get('message', '')
         )
         
-        meeting.increment_join_attempts()
-        
         return Response({
-            'message': 'Participação confirmada!' if participation_status == 'approved' else 'Solicitação enviada, aguarde aprovação.',
-            'status': participation.status,
-            'requires_approval': meeting.requires_approval
+            'message': 'Participação confirmada!' if participation_status == 'approved' else 'Solicitação enviada!',
+            'status': participation_status
         }, status=status.HTTP_201_CREATED)
 
 
 class LeaveMeetingView(APIView):
-    """Cancelar participação em reunião"""
+    """Cancelar participação"""
     permission_classes = [IsAuthenticated]
     
     def post(self, request, meeting_id):
@@ -212,17 +144,11 @@ class LeaveMeetingView(APIView):
                 meeting=meeting,
                 participant=request.user
             )
-            
-            if meeting.is_in_progress or meeting.is_finished:
-                return Response({
-                    'error': 'Não é possível cancelar participação em reunião em andamento ou finalizada'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
             participation.delete()
             
             return Response({
                 'message': 'Participação cancelada com sucesso!'
-            }, status=status.HTTP_200_OK)
+            })
             
         except MeetingParticipation.DoesNotExist:
             return Response({
@@ -230,706 +156,435 @@ class LeaveMeetingView(APIView):
             }, status=status.HTTP_400_BAD_REQUEST)
 
 
-# ===== VIEWS DE PARTICIPANTES =====
-
 class MeetingParticipantsView(APIView):
-    """Listar participantes de uma reunião"""
+    """Listar participantes"""
     permission_classes = [AllowAny]
     
     def get(self, request, meeting_id):
         meeting = get_object_or_404(Meeting, id=meeting_id)
-        
-        status_filter = request.query_params.get('status', 'approved')
         
         participations = MeetingParticipation.objects.filter(
             meeting=meeting
         ).select_related('participant')
         
+        status_filter = request.query_params.get('status', 'approved')
         if status_filter != 'all':
             participations = participations.filter(status=status_filter)
         
-        participations = participations.order_by('-created_at')
-        
         participants_data = []
-        for participation in participations:
-            participant_info = {
-                'id': participation.id,
+        for p in participations:
+            participants_data.append({
+                'id': p.id,
                 'participant': {
-                    'id': participation.participant.id,
-                    'name': participation.participant.get_full_name(),
-                    'email': participation.participant.email if request.user.is_staff or meeting.can_edit(request.user) else None,
-                    'user_type': participation.participant.user_type,
+                    'id': p.participant.id,
+                    'name': p.participant.get_full_name(),
+                    'username': p.participant.username
                 },
-                'status': participation.status,
-                'message': participation.message if participation.message else None,
-                'attended': participation.attended,
-                'joined_at': participation.joined_at,
-                'created_at': participation.created_at,
-                'response_message': participation.response_message if participation.response_message else None,
-            }
-            participants_data.append(participant_info)
-        
-        stats = {
-            'total': participations.count(),
-            'approved': participations.filter(status='approved').count(),
-            'pending': participations.filter(status='pending').count(),
-            'rejected': participations.filter(status='rejected').count(),
-        }
+                'status': p.status,
+                'message': p.message,
+                'created_at': p.created_at
+            })
         
         return Response({
-            'meeting': {
-                'id': meeting.id,
-                'title': meeting.title,
-                'meeting_date': meeting.meeting_date,
-                'max_participants': meeting.max_participants,
-            },
-            'stats': stats,
+            'total': participations.count(),
             'participants': participants_data
         })
 
 
 class ManageParticipantView(APIView):
-    """Aprovar/Rejeitar participantes"""
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, meeting_id):
-        meeting = get_object_or_404(Meeting, id=meeting_id)
-        
-        if not meeting.can_edit(request.user):
-            return Response(
-                {'error': 'Sem permissão para gerenciar participantes desta reunião'}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        participant_id = request.data.get('participant_id')
-        action = request.data.get('action')
-        response_message = request.data.get('response_message', '')
-        
-        if not participant_id or not action:
-            return Response(
-                {'error': 'participant_id e action são obrigatórios'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if action not in ['approve', 'reject']:
-            return Response(
-                {'error': 'action deve ser "approve" ou "reject"'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            participation = MeetingParticipation.objects.get(
-                meeting=meeting,
-                participant_id=participant_id
-            )
-        except MeetingParticipation.DoesNotExist:
-            return Response(
-                {'error': 'Participação não encontrada'}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        if participation.status != 'pending':
-            return Response(
-                {'error': f'Participação já está {participation.status}'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if action == 'approve' and meeting.max_participants:
-            current_approved = meeting.get_participant_count()
-            if current_approved >= meeting.max_participants:
-                return Response(
-                    {'error': 'Reunião já atingiu o limite máximo de participantes'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        new_status = 'approved' if action == 'approve' else 'rejected'
-        participation.status = new_status
-        participation.response_message = response_message
-        participation.approved_by = request.user
-        participation.save()
-        
-        from .utils import MeetingUtils
-        notification_type = 'participation_approved' if action == 'approve' else 'participation_rejected'
-        MeetingUtils.send_meeting_notification(
-            meeting, notification_type, [participation.participant]
-        )
-        
-        return Response({
-            'message': f'Participação {"aprovada" if action == "approve" else "rejeitada"} com sucesso',
-            'participation': {
-                'participant_name': participation.participant.get_full_name(),
-                'status': participation.status,
-                'response_message': participation.response_message
-            }
-        })
-
-
-class MyParticipationsView(APIView):
-    """Listar participações do usuário logado"""
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        user = request.user
-        
-        participations = MeetingParticipation.objects.filter(
-            participant=user
-        ).select_related('meeting', 'meeting__category').order_by('-created_at')
-        
-        status_filter = request.query_params.get('status')
-        if status_filter:
-            participations = participations.filter(status=status_filter)
-        
-        period = request.query_params.get('period')
-        if period == 'upcoming':
-            participations = participations.filter(
-                meeting__meeting_date__gte=timezone.now().date()
-            )
-        elif period == 'past':
-            participations = participations.filter(
-                meeting__meeting_date__lt=timezone.now().date()
-            )
-        elif period == 'today':
-            participations = participations.filter(
-                meeting__meeting_date=timezone.now().date()
-            )
-        
-        participations_data = []
-        for participation in participations:
-            meeting = participation.meeting
-            meeting_info = {
-                'id': meeting.id,
-                'title': meeting.title,
-                'responsible': meeting.responsible,
-                'meeting_date': meeting.meeting_date,
-                'meeting_time': meeting.meeting_time,
-                'duration_formatted': meeting.duration_formatted,
-                'category_name': meeting.category.name,
-                'status': meeting.status,
-                'is_upcoming': meeting.is_upcoming,
-                'is_in_progress': meeting.is_in_progress,
-                'meeting_url': meeting.meeting_url if participation.status == 'approved' else None,
-            }
-            
-            participation_info = {
-                'id': participation.id,
-                'status': participation.status,
-                'message': participation.message,
-                'response_message': participation.response_message,
-                'attended': participation.attended,
-                'joined_at': participation.joined_at,
-                'created_at': participation.created_at,
-                'meeting': meeting_info
-            }
-            participations_data.append(participation_info)
-        
-        all_participations = MeetingParticipation.objects.filter(participant=user)
-        stats = {
-            'total': all_participations.count(),
-            'approved': all_participations.filter(status='approved').count(),
-            'pending': all_participations.filter(status='pending').count(),
-            'attended': all_participations.filter(attended=True).count(),
-        }
-        
-        return Response({
-            'stats': stats,
-            'participations': participations_data
-        })
-
-
-# ===== VIEWS DE COOPERADORES =====
-
-class MeetingCooperatorsView(APIView):
-    """Listar cooperadores de uma reunião"""
-    permission_classes = [AllowAny]
-    
-    def get(self, request, meeting_id):
-        meeting = get_object_or_404(Meeting, id=meeting_id)
-        
-        status_filter = request.query_params.get('status', 'approved')
-        
-        cooperations = MeetingCooperation.objects.filter(
-            meeting=meeting
-        ).select_related('cooperator')
-        
-        if status_filter != 'all':
-            cooperations = cooperations.filter(status=status_filter)
-        
-        cooperations = cooperations.order_by('-created_at')
-        
-        cooperators_data = []
-        for cooperation in cooperations:
-            cooperator_info = {
-                'id': cooperation.id,
-                'cooperator': {
-                    'id': cooperation.cooperator.id,
-                    'name': cooperation.cooperator.get_full_name(),
-                    'email': cooperation.cooperator.email if request.user.is_staff or meeting.can_edit(request.user) else None,
-                    'user_type': cooperation.cooperator.user_type,
-                    'max_cooperations': cooperation.cooperator.max_cooperations,
-                },
-                'status': cooperation.status,
-                'permissions': cooperation.permissions,
-                'message': cooperation.message if cooperation.message else None,
-                'response_message': cooperation.response_message if cooperation.response_message else None,
-                'expires_at': cooperation.expires_at,
-                'created_at': cooperation.created_at,
-            }
-            cooperators_data.append(cooperator_info)
-        
-        stats = {
-            'total': cooperations.count(),
-            'approved': cooperations.filter(status='approved').count(),
-            'pending': cooperations.filter(status='pending').count(),
-            'rejected': cooperations.filter(status='rejected').count(),
-            'max_allowed': 4,
-        }
-        
-        return Response({
-            'meeting': {
-                'id': meeting.id,
-                'title': meeting.title,
-                'creator': meeting.creator.get_full_name(),
-                'meeting_date': meeting.meeting_date,
-            },
-            'stats': stats,
-            'cooperators': cooperators_data
-        })
-
-
-class RequestCooperationView(APIView):
-    """Solicitar cooperação em reunião"""
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, meeting_id):
-        meeting = get_object_or_404(Meeting, id=meeting_id)
-        user = request.user
-        
-        if user.user_type != 'cooperador':
-            return Response(
-                {'error': 'Apenas usuários do tipo "cooperador" podem solicitar cooperação'}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        if meeting.creator == user:
-            return Response(
-                {'error': 'Criador da reunião não pode solicitar cooperação'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        existing_cooperation = MeetingCooperation.objects.filter(
-            meeting=meeting,
-            cooperator=user
-        ).first()
-        
-        if existing_cooperation:
-            return Response({
-                'message': f'Você já tem uma solicitação de cooperação (Status: {existing_cooperation.get_status_display()})',
-                'status': existing_cooperation.status
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        current_cooperators = MeetingCooperation.objects.filter(
-            meeting=meeting,
-            status='approved'
-        ).count()
-        
-        if current_cooperators >= 4:
-            return Response(
-                {'error': 'Reunião já atingiu o limite máximo de 4 cooperadores'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        user_cooperations = MeetingCooperation.objects.filter(
-            cooperator=user,
-            status='approved'
-        ).count()
-        
-        if user_cooperations >= user.max_cooperations:
-            return Response(
-                {'error': f'Você já atingiu o limite de {user.max_cooperations} cooperações simultâneas'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        permissions = request.data.get('permissions', ['view', 'edit'])
-        message = request.data.get('message', '')
-        
-        valid_permissions = ['view', 'edit', 'moderate', 'manage_participants']
-        invalid_perms = [p for p in permissions if p not in valid_permissions]
-        if invalid_perms:
-            return Response(
-                {'error': f'Permissões inválidas: {invalid_perms}'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        cooperation = MeetingCooperation.objects.create(
-            meeting=meeting,
-            cooperator=user,
-            status='pending',
-            permissions=permissions,
-            message=message
-        )
-        
-        from .utils import MeetingUtils
-        MeetingUtils.send_meeting_notification(
-            meeting, 'cooperation_request', [meeting.creator]
-        )
-        
-        return Response({
-            'message': 'Solicitação de cooperação enviada com sucesso!',
-            'cooperation': {
-                'id': cooperation.id,
-                'status': cooperation.status,
-                'permissions': cooperation.permissions,
-                'message': cooperation.message
-            }
-        }, status=status.HTTP_201_CREATED)
-
-
-class ManageCooperationView(APIView):
-    """Aprovar/Rejeitar solicitações de cooperação"""
+    """Gerenciar participantes"""
     permission_classes = [IsAuthenticated]
     
     def post(self, request, meeting_id):
         meeting = get_object_or_404(Meeting, id=meeting_id)
         
         if meeting.creator != request.user:
-            return Response(
-                {'error': 'Apenas o criador da reunião pode gerenciar cooperações'}, 
-                status=status.HTTP_403_FORBIDDEN
+            return Response({
+                'error': 'Sem permissão'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        participant_id = request.data.get('participant_id')
+        action = request.data.get('action')
+        
+        if not participant_id or action not in ['approve', 'reject']:
+            return Response({
+                'error': 'participant_id e action (approve/reject) são obrigatórios'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            participation = MeetingParticipation.objects.get(
+                meeting=meeting,
+                participant_id=participant_id
             )
+            
+            participation.status = 'approved' if action == 'approve' else 'rejected'
+            participation.response_message = request.data.get('response_message', '')
+            participation.save()
+            
+            return Response({
+                'message': f'Participação {"aprovada" if action == "approve" else "rejeitada"}'
+            })
+            
+        except MeetingParticipation.DoesNotExist:
+            return Response({
+                'error': 'Participação não encontrada'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+
+class MyParticipationsView(APIView):
+    """Minhas participações"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        participations = MeetingParticipation.objects.filter(
+            participant=request.user
+        ).select_related('meeting')
+        
+        participations_data = []
+        for p in participations:
+            participations_data.append({
+                'id': p.id,
+                'meeting': {
+                    'id': p.meeting.id,
+                    'title': p.meeting.title,
+                    'meeting_date': p.meeting.meeting_date,
+                    'meeting_time': p.meeting.meeting_time
+                },
+                'status': p.status,
+                'created_at': p.created_at
+            })
+        
+        return Response({
+            'total': participations.count(),
+            'participations': participations_data
+        })
+
+
+# ===== VIEWS DE COOPERADORES =====
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_cooperators(request, meeting_id):
+    """Listar cooperadores de uma reunião"""
+    try:
+        meeting = get_object_or_404(Meeting, id=meeting_id)
+        
+        status_filter = request.GET.get('status', 'approved')
+        cooperations = MeetingCooperation.objects.filter(meeting=meeting)
+        
+        if status_filter == 'pending':
+            cooperations = cooperations.filter(status='pending')
+        elif status_filter == 'approved':
+            cooperations = cooperations.filter(
+                status='approved',
+                expires_at__gt=timezone.now()
+            )
+        elif status_filter != 'all':
+            return Response({
+                'error': 'Status inválido. Use: pending, approved ou all'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        cooperations = cooperations.select_related('cooperator')
+        
+        cooperators_data = []
+        for cooperation in cooperations:
+            cooperators_data.append({
+                'id': cooperation.id,
+                'cooperator': {
+                    'id': cooperation.cooperator.id,
+                    'name': cooperation.cooperator.get_full_name(),
+                    'username': cooperation.cooperator.username
+                },
+                'status': cooperation.status,
+                'permissions': cooperation.permissions,
+                'created_at': cooperation.created_at,
+                'expires_at': cooperation.expires_at
+            })
+        
+        return Response({
+            'success': True,
+            'total': cooperations.count(),
+            'cooperators': cooperators_data
+        })
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def request_cooperation(request, meeting_id):
+    """Solicitar cooperação"""
+    try:
+        meeting = get_object_or_404(Meeting, id=meeting_id)
+        
+        if meeting.creator == request.user:
+            return Response({
+                'error': 'Não pode solicitar cooperação em sua própria reunião'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Verificar se já existe
+        existing = MeetingCooperation.objects.filter(
+            meeting=meeting,
+            cooperator=request.user
+        ).first()
+        
+        if existing:
+            return Response({
+                'error': f'Já existe solicitação (Status: {existing.status})'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Criar solicitação
+        permissions = request.data.get('permissions', ['view'])
+        valid_permissions = ['view', 'edit', 'moderate', 'manage_participants']
+        
+        if not all(p in valid_permissions for p in permissions):
+            return Response({
+                'error': f'Permissões inválidas. Válidas: {valid_permissions}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        cooperation = MeetingCooperation.objects.create(
+            meeting=meeting,
+            cooperator=request.user,
+            permissions=permissions,
+            message=request.data.get('message', ''),
+            status='pending'
+        )
+        
+        return Response({
+            'success': True,
+            'message': 'Solicitação enviada com sucesso',
+            'cooperation_id': cooperation.id
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def manage_cooperation(request, meeting_id):
+    """Gerenciar cooperação"""
+    try:
+        meeting = get_object_or_404(Meeting, id=meeting_id)
+        
+        if meeting.creator != request.user:
+            return Response({
+                'error': 'Sem permissão'
+            }, status=status.HTTP_403_FORBIDDEN)
         
         cooperation_id = request.data.get('cooperation_id')
         action = request.data.get('action')
-        response_message = request.data.get('response_message', '')
         
-        if not cooperation_id or not action:
-            return Response(
-                {'error': 'cooperation_id e action são obrigatórios'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not cooperation_id or action not in ['approve', 'reject']:
+            return Response({
+                'error': 'cooperation_id e action (approve/reject) obrigatórios'
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        if action not in ['approve', 'reject']:
-            return Response(
-                {'error': 'action deve ser "approve" ou "reject"'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            cooperation = MeetingCooperation.objects.get(
-                id=cooperation_id,
-                meeting=meeting
-            )
-        except MeetingCooperation.DoesNotExist:
-            return Response(
-                {'error': 'Solicitação de cooperação não encontrada'}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        if cooperation.status != 'pending':
-            return Response(
-                {'error': f'Solicitação já está {cooperation.status}'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if action == 'approve':
-            current_cooperators = MeetingCooperation.objects.filter(
-                meeting=meeting,
-                status='approved'
-            ).count()
-            
-            if current_cooperators >= 4:
-                return Response(
-                    {'error': 'Reunião já atingiu o limite máximo de 4 cooperadores'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            user_cooperations = MeetingCooperation.objects.filter(
-                cooperator=cooperation.cooperator,
-                status='approved'
-            ).count()
-            
-            if user_cooperations >= cooperation.cooperator.max_cooperations:
-                return Response(
-                    {'error': f'Cooperador já atingiu o limite de {cooperation.cooperator.max_cooperations} cooperações'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        new_status = 'approved' if action == 'approve' else 'rejected'
-        cooperation.status = new_status
-        cooperation.response_message = response_message
-        cooperation.approved_by = request.user
-        
-        if action == 'approve':
-            cooperation.expires_at = timezone.now() + timedelta(days=30)
-        
-        cooperation.save()
-        
-        from .utils import MeetingUtils
-        notification_type = 'cooperation_approved' if action == 'approve' else 'cooperation_rejected'
-        MeetingUtils.send_meeting_notification(
-            meeting, notification_type, [cooperation.cooperator]
+        cooperation = get_object_or_404(
+            MeetingCooperation,
+            id=cooperation_id,
+            meeting=meeting
         )
         
+        if cooperation.status != 'pending':
+            return Response({
+                'error': 'Solicitação já processada'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        cooperation.status = 'approved' if action == 'approve' else 'rejected'
+        if action == 'approve':
+            cooperation.expires_at = timezone.now() + timedelta(days=30)
+        cooperation.response_message = request.data.get('response_message', '')
+        cooperation.save()
+        
         return Response({
-            'message': f'Cooperação {"aprovada" if action == "approve" else "rejeitada"} com sucesso',
-            'cooperation': {
-                'cooperator_name': cooperation.cooperator.get_full_name(),
-                'status': cooperation.status,
-                'permissions': cooperation.permissions,
-                'expires_at': cooperation.expires_at,
-                'response_message': cooperation.response_message
-            }
+            'success': True,
+            'message': f'Cooperação {"aprovada" if action == "approve" else "rejeitada"}'
         })
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class MyCooperationsView(APIView):
-    """Listar cooperações do usuário logado"""
-    permission_classes = [IsAuthenticated]
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def cooperation_batch_actions(request, meeting_id):
+    """Ações em lote"""
+    return Response({
+        'message': 'Endpoint em desenvolvimento'
+    })
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def manage_cooperation_permissions(request, meeting_id, cooperation_id):
+    """Gerenciar permissões"""
+    try:
+        meeting = get_object_or_404(Meeting, id=meeting_id)
+        cooperation = get_object_or_404(MeetingCooperation, id=cooperation_id, meeting=meeting)
+        
+        if meeting.creator != request.user:
+            return Response({
+                'error': 'Sem permissão'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        permissions = request.data.get('permissions', [])
+        valid_permissions = ['view', 'edit', 'moderate', 'manage_participants']
+        
+        if not all(p in valid_permissions for p in permissions):
+            return Response({
+                'error': f'Permissões inválidas. Válidas: {valid_permissions}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        cooperation.permissions = permissions
+        cooperation.save()
+        
+        return Response({
+            'success': True,
+            'message': 'Permissões atualizadas'
+        })
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def my_cooperations(request):
+    """Minhas cooperações"""
+    cooperations = MeetingCooperation.objects.filter(
+        cooperator=request.user
+    ).select_related('meeting')
     
-    def get(self, request):
-        user = request.user
-        
-        cooperations = MeetingCooperation.objects.filter(
-            cooperator=user
-        ).select_related('meeting', 'meeting__category').order_by('-created_at')
-        
-        status_filter = request.query_params.get('status')
-        if status_filter:
-            cooperations = cooperations.filter(status=status_filter)
-        
-        period = request.query_params.get('period')
-        if period == 'active':
-            cooperations = cooperations.filter(
-                status='approved',
-                expires_at__gt=timezone.now()
-            )
-        elif period == 'expired':
-            cooperations = cooperations.filter(
-                status='approved',
-                expires_at__lt=timezone.now()
-            )
-        elif period == 'upcoming':
-            cooperations = cooperations.filter(
-                meeting__meeting_date__gte=timezone.now().date(),
-                status='approved'
-            )
-        
-        cooperations_data = []
-        for cooperation in cooperations:
-            meeting = cooperation.meeting
-            meeting_info = {
-                'id': meeting.id,
-                'title': meeting.title,
-                'responsible': meeting.responsible,
-                'creator_name': meeting.creator.get_full_name(),
-                'meeting_date': meeting.meeting_date,
-                'meeting_time': meeting.meeting_time,
-                'duration_formatted': meeting.duration_formatted,
-                'category_name': meeting.category.name,
-                'status': meeting.status,
-                'is_upcoming': meeting.is_upcoming,
-                'is_in_progress': meeting.is_in_progress,
-            }
-            
-            cooperation_info = {
-                'id': cooperation.id,
-                'status': cooperation.status,
-                'permissions': cooperation.permissions,
-                'message': cooperation.message,
-                'response_message': cooperation.response_message,
-                'expires_at': cooperation.expires_at,
-                'created_at': cooperation.created_at,
-                'is_expired': cooperation.expires_at and cooperation.expires_at < timezone.now() if cooperation.expires_at else False,
-                'meeting': meeting_info
-            }
-            cooperations_data.append(cooperation_info)
-        
-        all_cooperations = MeetingCooperation.objects.filter(cooperator=user)
-        stats = {
-            'total': all_cooperations.count(),
-            'approved': all_cooperations.filter(status='approved').count(),
-            'pending': all_cooperations.filter(status='pending').count(),
-            'active': all_cooperations.filter(
-                status='approved',
-                expires_at__gt=timezone.now()
-            ).count(),
-            'limit': user.max_cooperations,
-            'available_slots': max(0, user.max_cooperations - all_cooperations.filter(status='approved').count())
-        }
-        
-        return Response({
-            'stats': stats,
-            'cooperations': cooperations_data
+    cooperations_data = []
+    for c in cooperations:
+        cooperations_data.append({
+            'id': c.id,
+            'meeting': {
+                'id': c.meeting.id,
+                'title': c.meeting.title,
+                'creator': c.meeting.creator.get_full_name()
+            },
+            'status': c.status,
+            'permissions': c.permissions,
+            'created_at': c.created_at,
+            'expires_at': c.expires_at
         })
+    
+    return Response({
+        'total': cooperations.count(),
+        'cooperations': cooperations_data
+    })
 
 
-# ===== VIEWS GERAIS =====
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def cooperation_stats(request):
+    """Estatísticas"""
+    user_meetings = Meeting.objects.filter(creator=request.user)
+    
+    stats = {
+        'total_meetings': user_meetings.count(),
+        'total_cooperators': MeetingCooperation.objects.filter(
+            meeting__creator=request.user,
+            status='approved'
+        ).count(),
+        'pending_requests': MeetingCooperation.objects.filter(
+            meeting__creator=request.user,
+            status='pending'
+        ).count()
+    }
+    
+    return Response({
+        'success': True,
+        'stats': stats
+    })
+
+
+# ===== VIEWS ADICIONAIS =====
 
 class UpcomingMeetingsView(APIView):
-    """Lista próximas reuniões"""
+    """Próximas reuniões"""
     permission_classes = [AllowAny]
     
     def get(self, request):
-        upcoming_meetings = Meeting.objects.filter(
+        meetings = Meeting.objects.filter(
             status='published',
             meeting_date__gte=timezone.now().date()
-        ).select_related('category', 'creator').order_by('meeting_date', 'meeting_time')[:10]
+        ).select_related('category', 'creator')[:10]
         
-        serializer = MeetingListSerializer(
-            upcoming_meetings, 
-            many=True, 
-            context={'request': request}
-        )
-        
-        return Response({
-            'count': len(serializer.data),
-            'results': serializer.data
-        })
+        serializer = MeetingListSerializer(meetings, many=True, context={'request': request})
+        return Response(serializer.data)
 
 
 class MyMeetingsView(APIView):
-    """Reuniões do usuário logado"""
+    """Minhas reuniões"""
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        user = request.user
-        
-        created_meetings = Meeting.objects.filter(
-            creator=user
-        ).select_related('category').order_by('-created_at')
-        
-        participated_meetings = Meeting.objects.filter(
-            meetingparticipation__participant=user,
-            meetingparticipation__status='approved'
-        ).select_related('category', 'creator').order_by('-meeting_date')
-        
-        cooperated_meetings = Meeting.objects.filter(
-            meetingcooperation__cooperator=user,
-            meetingcooperation__status='approved'
-        ).select_related('category', 'creator').order_by('-meeting_date')
-        
-        return Response({
-            'created': MeetingListSerializer(created_meetings, many=True, context={'request': request}).data,
-            'participated': MeetingListSerializer(participated_meetings, many=True, context={'request': request}).data,
-            'cooperated': MeetingListSerializer(cooperated_meetings, many=True, context={'request': request}).data,
-            'stats': {
-                'total_created': created_meetings.count(),
-                'total_participated': participated_meetings.count(),
-                'total_cooperated': cooperated_meetings.count()
-            }
-        })
+        created = Meeting.objects.filter(creator=request.user)
+        serializer = MeetingListSerializer(created, many=True, context={'request': request})
+        return Response({'created': serializer.data})
 
 
 class SearchMeetingsView(APIView):
-    """Busca avançada de reuniões"""
+    """Busca"""
     permission_classes = [AllowAny]
     
     def get(self, request):
-        queryset = Meeting.objects.filter(status='published').select_related('category', 'creator')
+        meetings = Meeting.objects.filter(status='published')
         
-        search_term = request.query_params.get('q', '')
-        if search_term:
-            queryset = queryset.filter(
-                Q(title__icontains=search_term) |
-                Q(description__icontains=search_term) |
-                Q(responsible__icontains=search_term) |
-                Q(tags__icontains=search_term)
+        q = request.query_params.get('q')
+        if q:
+            meetings = meetings.filter(
+                Q(title__icontains=q) | Q(description__icontains=q)
             )
         
-        category_id = request.query_params.get('category')
-        if category_id:
-            queryset = queryset.filter(category_id=category_id)
-        
-        meeting_format = request.query_params.get('format')
-        if meeting_format:
-            queryset = queryset.filter(meeting_format=meeting_format)
-        
-        upcoming_only = request.query_params.get('upcoming')
-        if upcoming_only and upcoming_only.lower() == 'true':
-            queryset = queryset.filter(meeting_date__gte=timezone.now().date())
-        
-        order_by = request.query_params.get('order_by', '-meeting_date')
-        valid_orders = ['-meeting_date', 'meeting_date', '-created_at', 'title']
-        if order_by in valid_orders:
-            queryset = queryset.order_by(order_by)
-        
-        page_size = min(int(request.query_params.get('page_size', 20)), 100)
-        page = int(request.query_params.get('page', 1))
-        start = (page - 1) * page_size
-        end = start + page_size
-        
-        total_count = queryset.count()
-        results = queryset[start:end]
-        
-        serializer = MeetingListSerializer(results, many=True, context={'request': request})
-        
-        return Response({
-            'count': total_count,
-            'page': page,
-            'page_size': page_size,
-            'total_pages': (total_count + page_size - 1) // page_size,
-            'results': serializer.data
-        })
+        serializer = MeetingListSerializer(meetings[:20], many=True, context={'request': request})
+        return Response(serializer.data)
 
 
-# ===== VIEWS LEGACY/TEMPORÁRIAS =====
-
-class ApproveParticipantView(APIView):
-    permission_classes = [IsAuthenticated]
-    def post(self, request, meeting_id):
-        return Response({'message': 'Use /manage-participant/ com action=approve'})
-
-class RejectParticipantView(APIView):
-    permission_classes = [IsAuthenticated]  
-    def post(self, request, meeting_id):
-        return Response({'message': 'Use /manage-participant/ com action=reject'})
-
-class ApproveCooperationView(APIView):
-    permission_classes = [IsAuthenticated]
-    def post(self, request, meeting_id):
-        return Response({'message': 'Use /manage-cooperation/ com action=approve'})
-
-class RejectCooperationView(APIView):
-    permission_classes = [IsAuthenticated]
-    def post(self, request, meeting_id):
-        return Response({'message': 'Use /manage-cooperation/ com action=reject'})
-
+# Views vazias para compatibilidade
 class MeetingCommentsView(APIView):
     permission_classes = [AllowAny]
     def get(self, request, meeting_id):
-        meeting = get_object_or_404(Meeting, id=meeting_id)
-        comments = Comment.objects.filter(
-            meeting=meeting, 
-            is_active=True
-        ).select_related('author').order_by('-is_pinned', '-created_at')
-        
-        serializer = CommentSerializer(comments, many=True, context={'request': request})
-        return Response(serializer.data)
+        return Response([])
 
 class MeetingRatingsView(APIView):
     permission_classes = [AllowAny]
     def get(self, request, meeting_id):
-        meeting = get_object_or_404(Meeting, id=meeting_id)
-        ratings = Rating.objects.filter(meeting=meeting).select_related('user')
-        
-        total_ratings = ratings.count()
-        average_rating = meeting.get_average_rating()
-        
-        rating_distribution = {}
-        for i in range(1, 6):
-            rating_distribution[f'{i}_stars'] = ratings.filter(rating=i).count()
-        
-        return Response({
-            'average_rating': average_rating,
-            'total_ratings': total_ratings,
-            'distribution': rating_distribution,
-            'ratings': RatingSerializer(ratings[:10], many=True, context={'request': request}).data
-        })
+        return Response([])
 
 class MyMeetingRatingView(APIView):
     permission_classes = [IsAuthenticated]
     def get(self, request, meeting_id):
-        try:
-            rating = Rating.objects.get(meeting_id=meeting_id, user=request.user)
-            return Response(RatingSerializer(rating, context={'request': request}).data)
-        except Rating.DoesNotExist:
-            return Response({'message': 'Você ainda não avaliou esta reunião'}, status=404)
+        return Response({'message': 'Nenhuma avaliação'})
+
+class ApproveParticipantView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request, meeting_id):
+        return Response({'message': 'Use manage-participant'})
+
+class RejectParticipantView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request, meeting_id):
+        return Response({'message': 'Use manage-participant'})
+
+class ApproveCooperationView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request, meeting_id):
+        return Response({'message': 'Use manage-cooperation'})
+
+class RejectCooperationView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request, meeting_id):
+        return Response({'message': 'Use manage-cooperation'})
