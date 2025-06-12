@@ -313,7 +313,12 @@ class Meeting(models.Model):
     @property
     def meeting_datetime(self):
         """Combina data e hora da reunião"""
-        return datetime.combine(self.meeting_date, self.meeting_time)
+        from django.utils import timezone as tz
+        dt = datetime.combine(self.meeting_date, self.meeting_time)
+        # Garantir que sempre retorne um datetime com timezone
+        if tz.is_naive(dt):
+            dt = tz.make_aware(dt)
+        return dt
     
     @property
     def end_datetime(self):
@@ -323,24 +328,36 @@ class Meeting(models.Model):
     @property
     def is_upcoming(self):
         """Verifica se a reunião é futura"""
-        return self.meeting_datetime > timezone.now()
+        from django.utils import timezone as tz
+        now = tz.now()
+        meeting_dt = tz.make_aware(self.meeting_datetime) if tz.is_naive(self.meeting_datetime) else self.meeting_datetime
+        return meeting_dt > now
     
     @property
     def is_in_progress(self):
         """Verifica se a reunião está acontecendo agora"""
-        now = timezone.now()
-        return self.meeting_datetime <= now <= self.end_datetime
+        from django.utils import timezone as tz
+        now = tz.now()
+        meeting_dt = tz.make_aware(self.meeting_datetime) if tz.is_naive(self.meeting_datetime) else self.meeting_datetime
+        end_dt = tz.make_aware(self.end_datetime) if tz.is_naive(self.end_datetime) else self.end_datetime
+        return meeting_dt <= now <= end_dt
     
     @property
     def is_finished(self):
         """Verifica se a reunião já terminou"""
-        return self.end_datetime < timezone.now()
+        from django.utils import timezone as tz
+        now = tz.now()
+        end_dt = tz.make_aware(self.end_datetime) if tz.is_naive(self.end_datetime) else self.end_datetime
+        return end_dt < now
     
     @property
     def time_until_start(self):
         """Tempo até o início da reunião"""
         if self.is_upcoming:
-            return self.meeting_datetime - timezone.now()
+            from django.utils import timezone as tz
+            now = tz.now()
+            meeting_dt = tz.make_aware(self.meeting_datetime) if tz.is_naive(self.meeting_datetime) else self.meeting_datetime
+            return meeting_dt - now
         return timedelta(0)
     
     @property

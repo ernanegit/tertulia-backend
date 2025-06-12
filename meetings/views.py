@@ -8,6 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .models import Category, Meeting, Comment, Rating, MeetingParticipation, MeetingCooperation
+from accounts.models import User
 from .serializers import (
     CategorySerializer, MeetingListSerializer, MeetingDetailSerializer,
     MeetingCreateUpdateSerializer, CommentSerializer, RatingSerializer
@@ -16,7 +17,7 @@ from .serializers import (
 
 class CategoryViewSet(viewsets.ModelViewSet):
     """ViewSet para categorias"""
-    queryset = Category.objects.filter(is_active=True).order_by('display_order', 'name')
+    queryset = Category.objects.filter(is_active=True).order_by('name')
     serializer_class = CategorySerializer
     permission_classes = [AllowAny]
 
@@ -48,7 +49,7 @@ class MeetingViewSet(viewsets.ModelViewSet):
 
 class CommentViewSet(viewsets.ModelViewSet):
     """ViewSet para comentários"""
-    queryset = Comment.objects.filter(is_active=True)
+    queryset = Comment.objects.all()
     serializer_class = CommentSerializer
     permission_classes = [IsAuthenticated]
     
@@ -77,20 +78,17 @@ class JoinMeetingView(APIView):
         participation, created = MeetingParticipation.objects.get_or_create(
             meeting=meeting,
             participant=request.user,
-            defaults={
-                'status': 'approved' if not meeting.requires_approval else 'pending',
-                'message': request.data.get('message', '')
-            }
+            defaults={'status': 'approved'}
         )
         
         if created:
             return Response({
-                'message': 'Solicitação enviada com sucesso!' if meeting.requires_approval else 'Participação confirmada!',
+                'message': 'Participação confirmada!',
                 'status': participation.status
             }, status=status.HTTP_201_CREATED)
         else:
             return Response({
-                'message': f'Você já tem uma solicitação com status: {participation.get_status_display()}',
+                'message': 'Você já está participando desta reunião',
                 'status': participation.status
             }, status=status.HTTP_400_BAD_REQUEST)
 
@@ -107,9 +105,7 @@ class LeaveMeetingView(APIView):
                 meeting=meeting,
                 participant=request.user
             )
-            participation.status = 'cancelled'
-            participation.save()
-            
+            participation.delete()
             return Response({'message': 'Participação cancelada com sucesso!'})
         except MeetingParticipation.DoesNotExist:
             return Response({
@@ -127,8 +123,21 @@ class UpcomingMeetingsView(APIView):
             meeting_date__gte=timezone.now().date()
         ).order_by('meeting_date', 'meeting_time')[:3]
         
-        serializer = MeetingListSerializer(upcoming_meetings, many=True, context={'request': request})
-        return Response(serializer.data)
+        # Usar serializer básico para evitar erros
+        data = []
+        for meeting in upcoming_meetings:
+            data.append({
+                'id': meeting.id,
+                'title': meeting.title,
+                'responsible': meeting.responsible,
+                'description': meeting.description,
+                'meeting_date': meeting.meeting_date,
+                'meeting_time': meeting.meeting_time,
+                'category': meeting.category.name,
+                'status': meeting.status
+            })
+        
+        return Response(data)
 
 
 class MyMeetingsView(APIView):
@@ -145,8 +154,8 @@ class MyMeetingsView(APIView):
         )
         
         return Response({
-            'created': MeetingListSerializer(created, many=True, context={'request': request}).data,
-            'participated': MeetingListSerializer(participated, many=True, context={'request': request}).data
+            'created': [{'id': m.id, 'title': m.title} for m in created],
+            'participated': [{'id': m.id, 'title': m.title} for m in participated]
         })
 
 

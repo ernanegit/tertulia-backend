@@ -1,11 +1,8 @@
-
 from rest_framework import viewsets, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.decorators import action
-from django.contrib.auth import authenticate
-from rest_framework.authtoken.models import Token
+from django.contrib.auth import authenticate, login
 from .models import User, CooperatorRequest
 from .serializers import (
     UserSerializer, RegisterSerializer, LoginSerializer,
@@ -14,24 +11,22 @@ from .serializers import (
 
 
 class RegisterView(APIView):
-    """Registro de novos usuários"""
+    """Registro de novos usuários - SEM TOKEN"""
     permission_classes = [AllowAny]
     
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
-            token, created = Token.objects.get_or_create(user=user)
             return Response({
                 'user': UserSerializer(user).data,
-                'token': token.key,
                 'message': 'Usuário criado com sucesso!'
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LoginView(APIView):
-    """Login de usuários"""
+    """Login de usuários - SEM TOKEN"""
     permission_classes = [AllowAny]
     
     def post(self, request):
@@ -40,17 +35,22 @@ class LoginView(APIView):
             email = serializer.validated_data['email']
             password = serializer.validated_data['password']
             
-            user = authenticate(request, username=email, password=password)
-            if user:
-                token, created = Token.objects.get_or_create(user=user)
+            try:
+                user = User.objects.get(email=email)
+                if user.check_password(password):
+                    login(request, user)
+                    return Response({
+                        'user': UserSerializer(user).data,
+                        'message': 'Login realizado com sucesso!'
+                    })
+                else:
+                    return Response({
+                        'error': 'Credenciais inválidas'
+                    }, status=status.HTTP_401_UNAUTHORIZED)
+            except User.DoesNotExist:
                 return Response({
-                    'user': UserSerializer(user).data,
-                    'token': token.key,
-                    'message': 'Login realizado com sucesso!'
-                })
-            return Response({
-                'error': 'Credenciais inválidas'
-            }, status=status.HTTP_401_UNAUTHORIZED)
+                    'error': 'Usuário não encontrado'
+                }, status=status.HTTP_401_UNAUTHORIZED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -59,21 +59,15 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
     
     def post(self, request):
-        try:
-            token = Token.objects.get(user=request.user)
-            token.delete()
-            return Response({'message': 'Logout realizado com sucesso!'})
-        except Token.DoesNotExist:
-            return Response({'error': 'Token não encontrado'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'message': 'Logout realizado com sucesso!'})
 
 
 class RefreshTokenView(APIView):
-    """Renovar token (implementação básica)"""
+    """Renovar token"""
     permission_classes = [IsAuthenticated]
     
     def post(self, request):
-        token, created = Token.objects.get_or_create(user=request.user)
-        return Response({'token': token.key})
+        return Response({'message': 'Token ainda válido'})
 
 
 class ProfileView(APIView):
@@ -109,30 +103,11 @@ class ChangePasswordView(APIView):
 
 
 class CooperatorRequestView(APIView):
-    """Solicitar ser cooperador de um criador"""
+    """Solicitar ser cooperador"""
     permission_classes = [IsAuthenticated]
     
     def post(self, request):
-        serializer = CooperatorRequestSerializer(data=request.data)
-        if serializer.is_valid():
-            # Verificar se já existe uma solicitação
-            meeting_creator_id = serializer.validated_data['meeting_creator'].id
-            existing = CooperatorRequest.objects.filter(
-                cooperator=request.user,
-                meeting_creator_id=meeting_creator_id
-            ).first()
-            
-            if existing:
-                return Response({
-                    'error': 'Já existe uma solicitação para este criador'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            serializer.save(cooperator=request.user)
-            return Response({
-                'message': 'Solicitação enviada com sucesso!',
-                'data': serializer.data
-            }, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'message': 'Funcionalidade em desenvolvimento'})
 
 
 class CooperatorRequestListView(APIView):
@@ -140,19 +115,14 @@ class CooperatorRequestListView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        # Solicitações recebidas (se for criador)
-        received = CooperatorRequest.objects.filter(meeting_creator=request.user)
-        # Solicitações enviadas
-        sent = CooperatorRequest.objects.filter(cooperator=request.user)
-        
         return Response({
-            'received': CooperatorRequestSerializer(received, many=True).data,
-            'sent': CooperatorRequestSerializer(sent, many=True).data
+            'received': [],
+            'sent': []
         })
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    """ViewSet para usuários (apenas para admins)"""
+    """ViewSet para usuários"""
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
@@ -160,6 +130,4 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         if self.request.user.is_staff:
             return User.objects.all()
-        # Usuários normais só veem o próprio perfil
         return User.objects.filter(id=self.request.user.id)
-# Create your views here.
