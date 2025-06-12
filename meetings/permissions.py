@@ -1,5 +1,7 @@
+# meetings/permissions.py - PERMISSÕES CUSTOMIZADAS
+
 from rest_framework import permissions
-from .models import MeetingCooperation
+from .models import MeetingCooperation, Meeting
 
 
 class IsMeetingCreatorOrCooperator(permissions.BasePermission):
@@ -145,7 +147,24 @@ class CanCreateMeeting(permissions.BasePermission):
             return False
         
         # Apenas criadores e cooperadores podem criar reuniões
-        return request.user.user_type in ['criador', 'cooperador']
+        if request.user.user_type not in ['criador', 'cooperador']:
+            return False
+        
+        # Verificar limite de reuniões ativas para cooperadores
+        if request.user.user_type == 'cooperador':
+            active_meetings = Meeting.objects.filter(
+                creator=request.user,
+                status__in=['published', 'approved', 'pending_approval']
+            ).count()
+            
+            # Limite de 5 reuniões ativas por cooperador
+            if active_meetings >= 5:
+                return False
+        
+        return True
+    
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
 
 
 class HasParticipatedInMeeting(permissions.BasePermission):
@@ -171,3 +190,88 @@ class HasParticipatedInMeeting(permissions.BasePermission):
             participant=request.user,
             status__in=['approved', 'attended']
         ).exists()
+
+
+class CanJoinMeeting(permissions.BasePermission):
+    """
+    Permissão para participar de reuniões
+    """
+    
+    def has_object_permission(self, request, view, obj):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        
+        # Verificar se a reunião permite participação
+        if obj.status != 'published':
+            return False
+        
+        # Verificar se a reunião já passou
+        if obj.is_finished:
+            return False
+        
+        # Verificar tipo de acesso
+        if obj.access_type == 'private':
+            # Apenas por convite - verificar se foi convidado
+            return False  # Implementar lógica de convites
+        
+        # Verificar limite de participantes
+        if obj.max_participants:
+            current_participants = obj.get_participant_count()
+            if current_participants >= obj.max_participants:
+                return False
+        
+        return True
+
+
+class CanRequestCooperation(permissions.BasePermission):
+    """
+    Permissão para solicitar cooperação
+    """
+    
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        
+        # Apenas cooperadores podem solicitar cooperação
+        return request.user.user_type == 'cooperador'
+    
+    def has_object_permission(self, request, view, obj):
+        if not self.has_permission(request, view):
+            return False
+        
+        # Não pode solicitar cooperação em sua própria reunião
+        if obj.creator == request.user:
+            return False
+        
+        # Verificar se já não é cooperador
+        try:
+            cooperation = MeetingCooperation.objects.get(
+                meeting=obj,
+                cooperator=request.user
+            )
+            # Se já existe, não pode solicitar novamente
+            return False
+        except MeetingCooperation.DoesNotExist:
+            return True
+
+
+class CanApproveCooperation(permissions.BasePermission):
+    """
+    Permissão para aprovar cooperação
+    """
+    
+    def has_object_permission(self, request, view, obj):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        
+        # Apenas criador da reunião pode aprovar cooperação
+        return obj.creator == request.user
+
+
+class IsActiveUser(permissions.BasePermission):
+    """
+    Permissão que verifica se o usuário está ativo
+    """
+    
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated and request.user.is_active

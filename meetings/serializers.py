@@ -1,8 +1,18 @@
-from rest_framework import serializers
-from django.utils import timezone
+# meetings/serializers.py - CORREÇÃO COMPLETA DOS IMPORTS
+
+from rest_framework import serializers  # ✅ IMPORT PRINCIPAL
+from django.utils import timezone  # ✅ IMPORT FALTANTE
+from django.db.models import Q  # ✅ PARA CONSULTAS COMPLEXAS
+
+# ✅ IMPORTS DOS MODELOS
 from .models import (
-    Category, Meeting, Comment, Rating, MeetingParticipation, 
-    MeetingCooperation, Notification
+    Category, 
+    Meeting, 
+    Comment, 
+    Rating, 
+    MeetingParticipation, 
+    MeetingCooperation, 
+    Notification
 )
 
 
@@ -243,6 +253,21 @@ class MeetingDetailSerializer(serializers.ModelSerializer):
     
     def get_tags_list(self, obj):
         return obj.get_tags_list()
+
+
+class MeetingCreateUpdateSerializer(serializers.ModelSerializer):
+    """Serializer para criação/edição de reuniões"""
+    
+    class Meta:
+        model = Meeting
+        fields = [
+            'title', 'responsible', 'description', 'category',
+            'meeting_date', 'meeting_time', 'duration_minutes', 'timezone',
+            'meeting_format', 'meeting_url', 'backup_url', 'meeting_password',
+            'access_type', 'max_participants', 'requires_approval',
+            'allow_comments', 'allow_ratings', 'is_recurring',
+            'agenda', 'prerequisites', 'materials', 'tags'
+        ]
     
     def validate_meeting_date(self, value):
         """Valida se a data não é no passado"""
@@ -261,33 +286,12 @@ class MeetingDetailSerializer(serializers.ModelSerializer):
         if value < 15 or value > 480:
             raise serializers.ValidationError("Duração deve ser entre 15 minutos e 8 horas.")
         return value
-
-
-class MeetingCreateUpdateSerializer(serializers.ModelSerializer):
-    """Serializer para criação/edição de reuniões"""
     
-    class Meta:
-        model = Meeting
-        fields = [
-            'title', 'responsible', 'description', 'category',
-            'meeting_date', 'meeting_time', 'duration_minutes', 'timezone',
-            'meeting_format', 'meeting_url', 'backup_url', 'meeting_password',
-            'access_type', 'max_participants', 'requires_approval',
-            'allow_comments', 'allow_ratings', 'is_recurring',
-            'agenda', 'prerequisites', 'materials', 'tags'
-        ]
-    
-    def validate(self, attrs):
-        """Validações complexas"""
-        # Validar formato da URL baseado no tipo
-        meeting_format = attrs.get('meeting_format')
-        meeting_url = attrs.get('meeting_url')
-        
-        if meeting_format and meeting_url:
-            # Aqui você pode implementar validação específica por formato
-            pass
-        
-        return attrs
+    def validate_max_participants(self, value):
+        """Valida limite de participantes"""
+        if value is not None and (value < 2 or value > 1000):
+            raise serializers.ValidationError("Limite deve ser entre 2 e 1000 participantes.")
+        return value
     
     def create(self, validated_data):
         """Criar reunião com creator automático"""
@@ -301,7 +305,6 @@ class CommentSerializer(serializers.ModelSerializer):
     """Serializer para comentários"""
     
     author_name = serializers.CharField(source='author.get_full_name', read_only=True)
-    author_avatar = serializers.URLField(source='author.profile_image.url', read_only=True)
     meeting_title = serializers.CharField(source='meeting.title', read_only=True)
     replies_count = serializers.SerializerMethodField()
     can_edit = serializers.SerializerMethodField()
@@ -310,7 +313,7 @@ class CommentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Comment
         fields = [
-            'id', 'meeting', 'meeting_title', 'author', 'author_name', 'author_avatar',
+            'id', 'meeting', 'meeting_title', 'author', 'author_name',
             'content', 'parent', 'is_active', 'is_pinned', 'likes_count',
             'replies_count', 'can_edit', 'replies', 'created_at', 'updated_at'
         ]
@@ -447,25 +450,55 @@ class NotificationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
-# Serializers para endpoints específicos
+# ===== SERIALIZERS PARA ENDPOINTS ESPECÍFICOS =====
+
 class JoinMeetingSerializer(serializers.Serializer):
     """Serializer para solicitação de participação"""
-    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+    message = serializers.CharField(
+        max_length=500, 
+        required=False, 
+        allow_blank=True,
+        help_text="Mensagem opcional ao solicitar participação"
+    )
 
 
 class ApproveRejectParticipantSerializer(serializers.Serializer):
     """Serializer para aprovar/rejeitar participante"""
-    participant_id = serializers.IntegerField()
-    response_message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+    participant_id = serializers.IntegerField(
+        help_text="ID do participante a ser aprovado/rejeitado"
+    )
+    response_message = serializers.CharField(
+        max_length=500, 
+        required=False, 
+        allow_blank=True,
+        help_text="Mensagem de resposta (opcional)"
+    )
+    
+    def validate_participant_id(self, value):
+        """Validar se o participante existe"""
+        try:
+            from accounts.models import User
+            User.objects.get(id=value)
+            return value
+        except User.DoesNotExist:
+            raise serializers.ValidationError("Participante não encontrado.")
 
 
 class RequestCooperationSerializer(serializers.Serializer):
     """Serializer para solicitação de cooperação"""
-    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+    message = serializers.CharField(
+        max_length=500, 
+        required=False, 
+        allow_blank=True,
+        help_text="Mensagem da solicitação"
+    )
     permissions = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=[
+            'view', 'edit', 'moderate', 'manage_participants'
+        ]),
         required=False,
-        default=list
+        default=list,
+        help_text="Lista de permissões solicitadas"
     )
 
 
@@ -478,76 +511,86 @@ class MeetingStatsSerializer(serializers.Serializer):
     total_participants = serializers.IntegerField()
     average_rating = serializers.FloatField()
     categories_stats = serializers.DictField()
+    
+    # Estatísticas por período
+    meetings_this_month = serializers.IntegerField(required=False)
+    meetings_this_week = serializers.IntegerField(required=False)
+    growth_percentage = serializers.FloatField(required=False)
 
 
 class SearchFilterSerializer(serializers.Serializer):
     """Serializer para filtros de busca"""
-    q = serializers.CharField(required=False, help_text="Termo de busca")
-    category = serializers.IntegerField(required=False, help_text="ID da categoria")
-    date_from = serializers.DateField(required=False, help_text="Data inicial")
-    date_to = serializers.DateField(required=False, help_text="Data final")
-    status = serializers.CharField(required=False, help_text="Status da reunião")
-    format = serializers.CharField(required=False, help_text="Formato da reunião")
-    upcoming = serializers.BooleanField(required=False, help_text="Apenas próximas")
-    has_slots = serializers.BooleanField(required=False, help_text="Com vagas disponíveis")
-    min_rating = serializers.FloatField(required=False, help_text="Avaliação mínima")
-    tags = serializers.CharField(required=False, help_text="Tags (separadas por vírgula)")
-    
-    def validate(self, attrs):
-        # Validar que date_from não é maior que date_to
-        date_from = attrs.get('date_from')
-        date_to = attrs.get('date_to')
-        
-        if date_from and date_to and date_from > date_to:
-            raise serializers.ValidationError(
-                "Data inicial não pode ser maior que data final."
-            )
-        
-        return attrs
-
-
-class ApproveRejectParticipantSerializer(serializers.Serializer):
-    """Serializer para aprovar/rejeitar participante"""
-    participant_id = serializers.IntegerField()
-    response_message = serializers.CharField(max_length=500, required=False, allow_blank=True)
-
-
-class RequestCooperationSerializer(serializers.Serializer):
-    """Serializer para solicitação de cooperação"""
-    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
-    permissions = serializers.ListField(
-        child=serializers.CharField(),
-        required=False,
-        default=list
+    q = serializers.CharField(
+        required=False, 
+        help_text="Termo de busca geral"
     )
-
-
-class MeetingStatsSerializer(serializers.Serializer):
-    """Serializer para estatísticas de reuniões"""
-    total_meetings = serializers.IntegerField()
-    published_meetings = serializers.IntegerField()
-    upcoming_meetings = serializers.IntegerField()
-    finished_meetings = serializers.IntegerField()
-    total_participants = serializers.IntegerField()
-    average_rating = serializers.FloatField()
-    categories_stats = serializers.DictField()
-
-
-class SearchFilterSerializer(serializers.Serializer):
-    """Serializer para filtros de busca"""
-    q = serializers.CharField(required=False, help_text="Termo de busca")
-    category = serializers.IntegerField(required=False, help_text="ID da categoria")
-    date_from = serializers.DateField(required=False, help_text="Data inicial")
-    date_to = serializers.DateField(required=False, help_text="Data final")
-    status = serializers.CharField(required=False, help_text="Status da reunião")
-    format = serializers.CharField(required=False, help_text="Formato da reunião")
-    upcoming = serializers.BooleanField(required=False, help_text="Apenas próximas")
-    has_slots = serializers.BooleanField(required=False, help_text="Com vagas disponíveis")
-    min_rating = serializers.FloatField(required=False, help_text="Avaliação mínima")
-    tags = serializers.CharField(required=False, help_text="Tags (separadas por vírgula)")
+    category = serializers.IntegerField(
+        required=False, 
+        help_text="ID da categoria"
+    )
+    date_from = serializers.DateField(
+        required=False, 
+        help_text="Data inicial (YYYY-MM-DD)"
+    )
+    date_to = serializers.DateField(
+        required=False, 
+        help_text="Data final (YYYY-MM-DD)"
+    )
+    status = serializers.ChoiceField(
+        choices=Meeting.STATUS_CHOICES,
+        required=False, 
+        help_text="Status da reunião"
+    )
+    format = serializers.ChoiceField(
+        choices=Meeting.MEETING_FORMATS,
+        required=False, 
+        help_text="Formato da reunião"
+    )
+    upcoming = serializers.BooleanField(
+        required=False, 
+        help_text="Apenas reuniões futuras"
+    )
+    has_slots = serializers.BooleanField(
+        required=False, 
+        help_text="Apenas reuniões com vagas disponíveis"
+    )
+    min_rating = serializers.FloatField(
+        required=False, 
+        min_value=1.0,
+        max_value=5.0,
+        help_text="Avaliação mínima (1.0 a 5.0)"
+    )
+    tags = serializers.CharField(
+        required=False, 
+        help_text="Tags separadas por vírgula"
+    )
+    order_by = serializers.ChoiceField(
+        choices=[
+            'meeting_date', '-meeting_date',
+            'created_at', '-created_at',
+            'title', '-title',
+            'view_count', '-view_count'
+        ],
+        required=False,
+        default='-meeting_date',
+        help_text="Campo para ordenação"
+    )
+    page = serializers.IntegerField(
+        required=False, 
+        min_value=1, 
+        default=1,
+        help_text="Número da página"
+    )
+    page_size = serializers.IntegerField(
+        required=False, 
+        min_value=1, 
+        max_value=100, 
+        default=20,
+        help_text="Itens por página (máximo 100)"
+    )
     
     def validate(self, attrs):
-        # Validar que date_from não é maior que date_to
+        """Validações cruzadas"""
         date_from = attrs.get('date_from')
         date_to = attrs.get('date_to')
         
@@ -557,3 +600,60 @@ class SearchFilterSerializer(serializers.Serializer):
             )
         
         return attrs
+
+
+class BulkActionSerializer(serializers.Serializer):
+    """Serializer para ações em lote"""
+    meeting_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="Lista de IDs das reuniões"
+    )
+    action = serializers.ChoiceField(
+        choices=[
+            'publish', 'unpublish', 'cancel', 'delete'
+        ],
+        help_text="Ação a ser executada"
+    )
+    reason = serializers.CharField(
+        max_length=500,
+        required=False,
+        help_text="Motivo da ação (opcional)"
+    )
+    
+    def validate_meeting_ids(self, value):
+        """Validar se todas as reuniões existem"""
+        if len(value) > 50:
+            raise serializers.ValidationError(
+                "Máximo de 50 reuniões por operação em lote."
+            )
+        
+        existing_count = Meeting.objects.filter(id__in=value).count()
+        if existing_count != len(value):
+            raise serializers.ValidationError(
+                "Algumas reuniões não foram encontradas."
+            )
+        
+        return value
+
+
+class MeetingTemplateSerializer(serializers.Serializer):
+    """Serializer para templates de reunião"""
+    name = serializers.CharField(max_length=100)
+    description = serializers.CharField(max_length=300, required=False)
+    template_data = serializers.JSONField(
+        help_text="Dados do template (campos da reunião)"
+    )
+    is_public = serializers.BooleanField(default=False)
+    category = serializers.IntegerField(required=False)
+    
+    def validate_template_data(self, value):
+        """Validar estrutura do template"""
+        required_fields = ['title', 'duration_minutes', 'meeting_format']
+        
+        for field in required_fields:
+            if field not in value:
+                raise serializers.ValidationError(
+                    f"Campo obrigatório '{field}' não encontrado no template."
+                )
+        
+        return value
